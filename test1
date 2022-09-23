@@ -1,0 +1,621 @@
+import pandas as pd
+pd.options.display.max_columns = None
+pd.options.display.max_rows = None
+import re
+class APICall():
+    def __init__(self, job_config_path, api_config_path, cf_creds_path, jobName):
+
+        dbutils.fs.mkdirs("/tmp/kpi/rx/config_path/")  # for first time run
+        temp_config_path = "dbfs:/tmp/kpi/rx/config_path/"
+        dir = os.listdir("/dbfs/tmp/kpi/rx/config_path")
+        print(len(dir))
+
+        if len(dir) != 0:
+            print("non empty")
+            dbutils.fs.rm("/tmp/kpi/rx/config_path/", True)
+            dbutils.fs.mkdirs("/tmp/kpi/rx/config_path/")
+            dbutils.fs.cp(api_config_path, temp_config_path + "api_config_uhg.json")
+            dbutils.fs.cp(job_config_path, temp_config_path + "job_config.json")
+            dbutils.fs.cp(cf_creds_path, temp_config_path + "cf_config.json")
+        else:
+            print("im in else")
+            dbutils.fs.cp(api_config_path, temp_config_path + "api_config_uhg.json")
+            dbutils.fs.cp(job_config_path, temp_config_path + "job_config.json")
+            dbutils.fs.cp(cf_creds_path, temp_config_path + "cf_config.json")
+
+        print("configs copied!")
+        time.sleep(30)
+
+        self.api_config = json.loads(open("/dbfs/tmp/kpi/rx/config_path/api_config_uhg.json").read())
+        self.job_config = json.loads(open("/dbfs/tmp/kpi/rx/config_path/job_config.json").read())
+        self.cf_config = json.loads(open("/dbfs/tmp/kpi/rx/config_path/cf_config.json").read())
+
+        self.requestEndpoint = self.job_config['requestEndpoint']
+        self.refreshMapping = self.job_config['refreshMapping']
+        self.timeLevel = self.job_config['timeLevel']
+        self.metricSource = self.job_config['metricSource']
+        self.loadType = self.job_config['loadType']
+        self.calcMetricMappingLoc = self.job_config['calcMetricMappingLoc']
+        self.deltaDataLoc = self.job_config['deltaDataLoc']
+        self.requestJsonLoc = self.job_config['requestJsonLoc']
+        self.lob = self.job_config['lob']
+        self.databaseName = self.job_config['databaseName']
+        self.tableName = self.job_config['tableName']
+
+        print("getting job details from json")
+        self.job_details = self.job_config['job_details']
+
+        self.jobName = jobName
+        self.subjobName = jobName
+
+        print(self.jobName)
+
+        self.application = self.job_details['application']
+        self.product = self.job_details['product']
+        self.runType = self.job_details['runType']
+        self.notificationEmail = self.job_details['notificationEmail']
+        self.env = self.job_details['env']
+        self.subscription = self.job_details['subscription']
+
+        print("getting credentials for common framework")
+        self.commonFrameworkClientID = self.cf_config['client-id']
+        self.commonFrameworkClientSecret = self.cf_config["client-secret"]
+        self.commonFrameworkClientScope = self.cf_config["client-scope"]
+        self.jobTrackingKey = self.cf_config["jobtracking-subscription-key"]
+        self.ApimKey = self.cf_config["apim-subscription-key"]
+        self.tokenEndpoint = self.cf_config["token-endpoint"]
+        self.notificationEndpoint = self.cf_config["notification-endpoint"]
+        self.jobFailEndpoint = self.cf_config["job-fail-endpoint"]
+        self.jobEndEndpoint = self.cf_config["job-end-endpoint"]
+        self.jobStartEndpoint = self.cf_config["job-start-endpoint"]
+
+        print("initialising done!")
+
+    def login(self, config_path):
+        api2.importConfigFile(config_path)
+        login = api2.Login()
+        cids = login.getCompanyId()
+
+        uhg_idx = -1
+        for i, cid in enumerate(cids):
+            if cid['globalCompanyId'] == 'united8' or cid['globalCompanyId'] == "optumr1":
+                uhg_idx = i
+        if uhg_idx == -1:
+            self.headers_uhg = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + self.token,
+                "x-api-key": self.api_config['api_key'],
+                "x-proxy-global-company-id": "united8",
+                "x-adobe-dma-company": "United Health Group"
+            }
+
+        print("Login successful!")
+
+    def get_calcmetric_mapping(self):
+        # ,rsid,id,name,description,owner,polarity,precision,type
+
+        if self.refreshMapping == "Y":
+            rsids = ['']
+            calcmetric_df = self.endpoint_uhg.getCalculatedMetrics(rsid=rsids)
+            calcmetric_df.to_csv("/dbfs/tmp/calcmetrics_mapping.csv")
+        else:
+            calcmetric_df = pd.read_csv("/dbfs/tmp/calcmetrics_mapping.csv")
+
+        print("Calculated Metrics Mapping written successfully!")
+
+        return calcmetric_df
+
+    def get_column_description(self, column_id, calcmetric_df):
+        col_row = calcmetric_df[calcmetric_df['id'] == column_id]
+
+        if col_row.shape[0] == 0 or col_row.shape[0] > 1:
+            return None
+
+        col = col_row.iloc[0]['description']
+        return col
+
+    def request_call(self):
+        fpc_raw_data = pd.read_csv("/dbfs/tmp/FPC.csv")
+        if fpc_raw_data:
+            print("Got fpc_raw_data !")
+            return fpc_raw_data
+        else:
+            print("fpc_raw_data is NA!")
+
+    def get_date(self, rsid, dimension, date_today, headers):
+        item_endpoint = "https://analytics.adobe.io/api/united8/reports/topItems?rsid={rsid}&dimension={dimension}&locale=en_US&lookupNoneValues=true&limit=1200&page=0&dateRange=2020-01-01T00%3A00%3A00.000%2F{today}T00%3A00%3A00.000"
+        res = req.get(item_endpoint.format(dimension=dimension, rsid=rsid, today=date_today), headers=headers)
+        res_json = json.loads(res.text)
+        res_rows = res_json['rows']
+        return res_rows
+        # print(res_rows)
+
+    def form_data_structure(fpc_raw_data, calcmetric_df):
+        def get_metric_name_desc_segments(check_lob, metric_desc):
+
+            # print(metric_desc)
+
+            # if (self.metricSource).lower() == "adobe":
+            category_type = "Site Activity"
+            try:
+                # splitted = metric_name.split("|")
+                splitted = re.split('[\[\|\]]', metric_desc)
+                # print(splitted)
+                channel = splitted[3].strip()
+                product = splitted[4].strip()
+                metric_name = splitted[5].strip()
+                # print((splitted))
+                if len(splitted) < 7:
+                    category = "Stand Alone"
+                else:
+                    if splitted[6] == '':
+                        category = "Stand Alone"
+                    else:
+                        category = splitted[6].strip()
+
+                lob_metric_name = splitted[2].strip()
+                if check_lob.lower() == "no filter":
+                    lob = "ALL LoB"
+                    return [channel, lob, product, category_type, category, metric_name]
+                else:
+                    lob = lob_metric_name.upper()
+                    return [channel, lob, product, category_type, category, metric_name]
+
+            except:
+                raise Exception("length of metric desc isnt correct!")
+        print("forming data structure..")
+        data = []
+        # date_today = datetime.today().strftime('%Y-%m-%d')
+        try:
+            if '# Date' in fpc_raw_data['col1'][3]:
+                year = int(fpc_raw_data['col1'][3][-4:])
+                print(year)
+        except:
+            raise Exception("order of metric filter isn't correct: Unable to fetch year ")
+
+        # rsid = self.body['rsid']
+        rs_name = (fpc_raw_data['col1'][2]).split(': ')[1]
+        print(rs_name)
+        # date_response = self.get_date(self.body['rsid'], dimension, date_today, self.headers_uhg)
+        # print(date_response)
+
+        # lob = self.body['globalFilters'][0]['segmentDefinition']['container']['pred']['list'][0]
+        check_lob= (fpc_raw_data['col1'][2]).split(': ')[1]
+        if ',' in check_lob:
+            check_lob = check_lob.split(',')[0]
+        else:
+            check_lob= 'no filter'
+
+        for ind in fpc_raw_data.index:
+            if '#' in fpc_raw_data['col1'][ind] and 'Metrics' in fpc_raw_data['col1'][ind] and 'by' not in \
+                    fpc_raw_data['col1'][ind]:
+                # Metrics_name = fpc_raw_data['col1'][ind].split('# ')[1]
+                FPC_KPI_Metrics = pd.DataFrame(columns=['metrix', 'all_visits_this_year', 'all_visits_last_year'])
+                for new_ind in fpc_raw_data.index[ind + 2:]:
+                    if '####' in fpc_raw_data['col1'][new_ind]:
+                        break
+                    if '|' in fpc_raw_data['col1'][new_ind]:
+                        record = f"{fpc_raw_data['col1'][new_ind]},{fpc_raw_data['col2'][new_ind]},{fpc_raw_data['col3'][new_ind]}"
+                        FPC_KPI_Metrics = FPC_KPI_Metrics.append(
+                            {'metrix': fpc_raw_data['col1'][new_ind],
+                             'all_visits_this_year': fpc_raw_data['col2'][new_ind],
+                             'all_visits_last_year': fpc_raw_data['col3'][new_ind]}, ignore_index=True)
+                print(FPC_KPI_Metrics)
+            elif '#' in fpc_raw_data['col1'][ind] and 'Metrics' in fpc_raw_data['col1'][ind] and 'month - this' in \
+                    fpc_raw_data['col1'][ind]:
+                FPC_KPI_Metrics_By_Month_this_year = pd.DataFrame(
+                    columns=['metrix', 'all_visits_this_year_january', 'all_visits_this_year_february',
+                             'all_visits_this_year_march',
+                             'all_visits_this_year_april', 'all_visits_this_year_may', 'all_visits_this_year_june',
+                             'all_visits_this_year_july', 'all_visits_this_year_august',
+                             'all_visits_this_year_september',
+                             'all_visits_this_year_october', 'all_visits_this_year_november',
+                             'all_visits_this_year_december'])
+                for new_ind in fpc_raw_data.index[ind + 5:]:
+                    if '####' in fpc_raw_data['col1'][new_ind]:
+                        break
+                    if '|' in fpc_raw_data['col1'][new_ind]:
+                        record = f"{fpc_raw_data['col1'][new_ind]},{fpc_raw_data['col2'][new_ind]},{fpc_raw_data['col3'][new_ind]},{fpc_raw_data['col4'][new_ind]},{fpc_raw_data['col5'][new_ind]},{fpc_raw_data['col6'][new_ind]},{fpc_raw_data['col7'][new_ind]},{fpc_raw_data['col8'][new_ind]},{fpc_raw_data['col9'][new_ind]},{fpc_raw_data['col10'][new_ind]},{fpc_raw_data['col11'][new_ind]},{fpc_raw_data['col12'][new_ind]},{fpc_raw_data['col13'][new_ind]}"
+                        FPC_KPI_Metrics_By_Month_this_year = FPC_KPI_Metrics_By_Month_this_year.append(
+                            {'metrix': fpc_raw_data['col1'][new_ind],
+                             'all_visits_this_year_january': fpc_raw_data['col2'][new_ind],
+                             'all_visits_this_year_february': fpc_raw_data['col3'][new_ind],
+                             'all_visits_this_year_march': fpc_raw_data['col4'][new_ind],
+                             'all_visits_this_year_april': fpc_raw_data['col5'][new_ind],
+                             'all_visits_this_year_may': fpc_raw_data['col6'][new_ind],
+                             'all_visits_this_year_june': fpc_raw_data['col7'][new_ind],
+                             'all_visits_this_year_july': fpc_raw_data['col8'][new_ind],
+                             'all_visits_this_year_august': fpc_raw_data['col9'][new_ind],
+                             'all_visits_this_year_september': fpc_raw_data['col10'][new_ind],
+                             'all_visits_this_year_october': fpc_raw_data['col11'][new_ind],
+                             'all_visits_this_year_november': fpc_raw_data['col12'][new_ind],
+                             'all_visits_this_year_december': fpc_raw_data['col13'][new_ind]}, ignore_index=True)
+                print(FPC_KPI_Metrics_By_Month_this_year)
+            elif '#' in fpc_raw_data['col1'][ind] and 'Metrics' in fpc_raw_data['col1'][ind] and 'month - last' in \
+                    fpc_raw_data['col1'][ind]:
+                FPC_KPI_Metrics_By_Month_last_year = pd.DataFrame(
+                    columns=['metrix', 'all_visits_last_year_january', 'all_visits_last_year_february',
+                             'all_visits_last_year_march',
+                             'all_visits_last_year_april', 'all_visits_last_year_may', 'all_visits_last_year_june',
+                             'all_visits_last_year_july', 'all_visits_last_year_august',
+                             'all_visits_last_year_september',
+                             'all_visits_last_year_october', 'all_visits_last_year_november',
+                             'all_visits_last_year_december'])
+                for new_ind in fpc_raw_data.index[ind + 5:]:
+                    if '####' in fpc_raw_data['col1'][new_ind]:
+                        break
+                    if '|' in fpc_raw_data['col1'][new_ind]:
+                        record = f"{fpc_raw_data['col1'][new_ind]},{fpc_raw_data['col2'][new_ind]},{fpc_raw_data['col3'][new_ind]},{fpc_raw_data['col4'][new_ind]},{fpc_raw_data['col5'][new_ind]},{fpc_raw_data['col6'][new_ind]},{fpc_raw_data['col7'][new_ind]},{fpc_raw_data['col8'][new_ind]},{fpc_raw_data['col9'][new_ind]},{fpc_raw_data['col10'][new_ind]},{fpc_raw_data['col11'][new_ind]},{fpc_raw_data['col12'][new_ind]},{fpc_raw_data['col13'][new_ind]}"
+                        FPC_KPI_Metrics_By_Month_last_year = FPC_KPI_Metrics_By_Month_last_year.append(
+                            {'metrix': fpc_raw_data['col1'][new_ind],
+                             'all_visits_last_year_january': fpc_raw_data['col2'][new_ind],
+                             'all_visits_last_year_february': fpc_raw_data['col3'][new_ind],
+                             'all_visits_last_year_march': fpc_raw_data['col4'][new_ind],
+                             'all_visits_last_year_april': fpc_raw_data['col5'][new_ind],
+                             'all_visits_last_year_may': fpc_raw_data['col6'][new_ind],
+                             'all_visits_last_year_june': fpc_raw_data['col7'][new_ind],
+                             'all_visits_last_year_july': fpc_raw_data['col8'][new_ind],
+                             'all_visits_last_year_august': fpc_raw_data['col9'][new_ind],
+                             'all_visits_last_year_september': fpc_raw_data['col10'][new_ind],
+                             'all_visits_last_year_october': fpc_raw_data['col11'][new_ind],
+                             'all_visits_last_year_november': fpc_raw_data['col12'][new_ind],
+                             'all_visits_last_year_december': fpc_raw_data['col13'][new_ind]}, ignore_index=True)
+                print(FPC_KPI_Metrics_By_Month_last_year)
+            elif '#' in fpc_raw_data['col1'][ind] and 'Metrics' in fpc_raw_data['col1'][ind] and 'quarter' in \
+                    fpc_raw_data['col1'][ind]:
+                FPC_KPI_Metrics_By_quarter = pd.DataFrame(
+                    columns=['metrix', 'all_visits_last_year_1', 'all_visits_last_year_2', 'all_visits_last_year_3',
+                             'all_visits_last_year_4', 'all_visits_this_year_1', 'all_visits_this_year_2',
+                             'all_visits_this_year_3', 'all_visits_this_year_4'])
+                for new_ind in fpc_raw_data.index[ind + 5:]:
+                    if '####' in fpc_raw_data['col1'][new_ind]:
+                        break
+                    if '|' in fpc_raw_data['col1'][new_ind]:
+                        record = f"{fpc_raw_data['col1'][new_ind]},{fpc_raw_data['col2'][new_ind]},{fpc_raw_data['col3'][new_ind]},{fpc_raw_data['col4'][new_ind]},{fpc_raw_data['col5'][new_ind]},{fpc_raw_data['col6'][new_ind]},{fpc_raw_data['col7'][new_ind]},{fpc_raw_data['col8'][new_ind]},{fpc_raw_data['col9'][new_ind]}"
+                        FPC_KPI_Metrics_By_quarter = FPC_KPI_Metrics_By_quarter.append(
+                            {'metrix': fpc_raw_data['col1'][new_ind],
+                             'all_visits_last_year_1': fpc_raw_data['col2'][new_ind],
+                             'all_visits_last_year_2': fpc_raw_data['col3'][new_ind],
+                             'all_visits_last_year_3': fpc_raw_data['col4'][new_ind],
+                             'all_visits_last_year_4': fpc_raw_data['col5'][new_ind],
+                             'all_visits_this_year_1': fpc_raw_data['col6'][new_ind],
+                             'all_visits_this_year_2': fpc_raw_data['col7'][new_ind],
+                             'all_visits_this_year_3': fpc_raw_data['col8'][new_ind],
+                             'all_visits_this_year_4': fpc_raw_data['col9'][new_ind]
+                             }, ignore_index=True)
+                print(FPC_KPI_Metrics_By_quarter)
+
+        # for row in FPC_KPI_Metrics.itertuples():
+        #     timeid = 3
+        #     rsid = 'rsid1'
+        #     rs_name = rs_name
+        #     metric_segments = row.metrix.split('|')[5]
+        #     for x in range(2,4):
+        #         if x == 2:
+        #             timeid = year
+        #         else:timeid = year -1
+        #         col_value = row[x]
+        #         row_value = f'{timeid},{rsid},{rs_name},{metric_segments},{col_value}'
+        #         data.append(row_value)
+        # print(data)
+        for row in FPC_KPI_Metrics_By_Month_last_year.itertuples():
+            timeid = 3
+            rsid = 'rsid1'
+            rs_name = rs_name
+            metric_segments = row.metrix
+            if '|' in metric_segments:
+                metric_segments_list = get_metric_name_desc_segments(check_lob,metric_segments)
+            else:
+                metric_segments_list = get_metric_name_desc_segments_calcmetric_df(check_lob,metric_segments,calcmetric_df)
+
+            for x in range(1,13):
+                if x <10:
+                    timeid = f'{year-1}0{x}'
+                else:timeid = f'{year-1}{x}'
+                col_value = float(row[x+1])
+                row_value = [timeid, rsid, rs_name] + metric_segments_list + [col_value]
+                data.append(row_value)
+        # print(data)
+        for row in FPC_KPI_Metrics_By_Month_this_year.itertuples():
+            timeid = 3
+            rsid = 'rsid1'
+            rs_name = rs_name
+            metric_segments = row.metrix
+            if '|' in metric_segments:
+                metric_segments_list = get_metric_name_desc_segments(check_lob,metric_segments)
+            else:
+                metric_segments_list = get_metric_name_desc_segments_calcmetric_df(check_lob,metric_segments,calcmetric_df)
+
+            for x in range(1,13):
+                if x <10:
+                    timeid = f'{year}0{x}'
+                else:timeid = f'{year}{x}'
+                col_value = float(row[x+1])
+                row_value = [timeid, rsid, rs_name] + metric_segments_list + [col_value]
+                data.append(row_value)
+        # print(data)
+        for row in FPC_KPI_Metrics_By_quarter.itertuples():
+            timeid = 3
+            rsid = 'rsid1'
+            rs_name = rs_name
+            metric_segments = row.metrix
+            if '|' in metric_segments:
+                metric_segments_list = get_metric_name_desc_segments(check_lob,metric_segments)
+            else:
+                metric_segments_list = get_metric_name_desc_segments_calcmetric_df(check_lob,metric_segments,calcmetric_df)
+            for x in range(1,9):
+                if x <5:
+                    timeid = f'{year-1}0{x}'
+                else:timeid = f'{year}0{x}'
+                col_value = float(row[x+1])
+                row_value = [timeid, rsid, rs_name] + metric_segments_list + [col_value]
+                data.append(row_value)
+        print(data)
+        exit()
+
+    # def check_lob(self, metric_desc):
+    #     evar38Flag = ""
+    #     try:
+    #         lob_evar38 = self.body['globalFilters'][0]['segmentDefinition']['container']['pred']['list'][0]
+    #         evar38Flag = "Y"
+    #         return (self.get_metric_name_desc_segments(lob_evar38, evar38Flag, metric_desc))
+    #     except:
+    #         lob_evar38 = ""
+    #         evar38Flag = "N"
+    #         arr = self.get_metric_name_desc_segments(lob_evar38, evar38Flag, metric_desc)
+    #         return (arr)
+
+    def get_metric_name_desc_segments_calcmetric_df(check_lob, metric_name,calcmetric_df):
+
+        # print(metric_desc)
+
+        if (self.metricSource).lower() == "adobe":
+            category_type = "Site Activity"
+        try:
+            match_index_df= df[df['name'] == metric_name]
+            if not match_index_df.empty:
+                metric_desc = match_index_df['description'].values[0]
+            else:
+                print('Unable to fecth/find the col_name in calcmetric_df')
+
+
+            # splitted = metric_name.split("|")
+            splitted = re.split('[\[\|\]]', metric_desc)
+            # print(splitted)
+            channel = splitted[3].strip()
+            product = splitted[4].strip()
+            metric_name = splitted[5].strip()
+
+            if splitted[6] == '':
+                category = "Stand Alone"
+            else:
+                category = splitted[6].strip()
+
+            lob_metric_name = splitted[2].strip()
+            if check_lob.lower() == "no filter":
+                lob = "ALL LoB"
+                return [channel, lob, product, category_type, category, metric_name]
+            else:
+                lob = lob_metric_name.upper()
+                return [channel, lob, product, category_type, category, metric_name]
+
+        except:
+            raise Exception("length of metric desc isnt correct!")
+
+    def get_metric_name_desc_segments(check_lob, metric_desc):
+
+    # print(metric_desc)
+
+        if (self.metricSource).lower() == "adobe":
+            category_type = "Site Activity"
+        try:
+            # splitted = metric_name.split("|")
+            splitted = re.split('[\[\|\]]', metric_desc)
+            # print(splitted)
+            channel = splitted[3].strip()
+            product = splitted[4].strip()
+            metric_name = splitted[5].strip()
+
+            if splitted[6] == '':
+                category = "Stand Alone"
+            else:
+                category = splitted[6].strip()
+
+            lob_metric_name = splitted[2].strip()
+            if check_lob.lower() == "no filter":
+                lob = "ALL LoB"
+                return [channel, lob, product, category_type, category, metric_name]
+            else:
+                lob = lob_metric_name.upper()
+                return [channel, lob, product, category_type, category, metric_name]
+
+        except:
+            raise Exception("length of metric desc isnt correct!")
+
+
+def createDF(self, data):
+    print("creating schema..")
+    try:
+        schemaStr = StructType([
+            StructField("timeid", StringType(), True),
+            StructField("rpt_suite_id", StringType(), True),
+            StructField("rpt_suite_nm", StringType(), True),
+            StructField("channel", StringType(), True),
+            StructField("lob", StringType(), True),
+            StructField("product", StringType(), True),
+            StructField("category_type", StringType(), True),
+            StructField("category", StringType(), True),
+            StructField("metric_name", StringType(), True),
+            StructField("metric_value", StringType(), True)
+        ])
+        df = spark.createDataFrame(data=data, schema=schemaStr)
+    except:
+        raise Exception("datatypes dont match!!")
+
+    create_ts = self.curr_time()
+    df = df.withColumn("create_ts", lit(create_ts)).withColumn("update_ts", lit(create_ts))
+
+
+def time_lvl_join(self, df):
+    print("im in timelevel")
+    timelvl = (self.timeLevel).lower()
+    print(timelvl)
+    try:
+        time_df = spark.sql("select * from sl_kpi.timelvl_timeid_drvr_std")
+    except:
+        raise Exception("time level view is not available")
+
+    tim_df_filtered = time_df.filter(lower(col("timelvlnm")) == timelvl)
+    print(tim_df_filtered.show(10))
+    df_updated = tim_df_filtered.alias('tim_df_filtered').join(df.alias('df'), tim_df_filtered.timeid == df.timeid,
+                                                               "inner").select('df.*', 'tim_df_filtered.timelvl',
+                                                                               'tim_df_filtered.timeidnm',
+                                                                               'tim_df_filtered.timelvlnm')
+    print(df_updated.show(10))
+    final_df = self.final_data_extract(df=df_updated)
+    print(final_df.printSchema())
+    print("time level join completed!")
+
+    return final_df
+
+
+def get_report_suite(self, rsid):
+    item_endpoint = f"https://analytics.adobe.io/api/united8/reportsuites/collections/suites/{rsid}"
+    res = req.get(item_endpoint, headers=self.headers_uhg)
+    res_json = json.loads(res.text)
+    return res_json['name']
+
+
+def curr_time(self):
+    tz_CHI = pytz.timezone('America/Chicago')
+    datetime_CHI = datetime.now(tz_CHI)
+    current_time = datetime_CHI.strftime("%Y-%m-%d %H:%M:%S")
+    return (current_time)
+
+
+def final_data_extract(self, df):
+    df = df.withColumn("sgm_cd", lit("")).withColumn("sgm_desc", lit("")).withColumn("seg_cd", lit("")).withColumn(
+        "seg_desc", lit("")).withColumn("metric_format", lit("")).withColumn("page_url", lit("")).withColumn("data_src",
+                                                                                                             lit(""))
+
+    col_list = ["timelvl", "timelvlnm", "timeid", "timeidnm", "rpt_suite_id", "rpt_suite_nm", "channel", "lob",
+                "product", "category_type", "category", "sgm_cd", "sgm_desc", "seg_cd", "seg_desc", "metric_name",
+                "metric_value", "metric_format", "page_url", "data_src", "create_ts", "update_ts", ]
+    df = df.select(*col_list)
+    df.show(10)
+    print("final data extract created!")
+    return df
+
+
+def write_delta(self, spark, dataFrame):
+    print("writing delta to storage account..")
+    print(self.loadType)
+    try:
+        print("inside try")
+        if (self.loadType.lower() == "upsert"):
+            tablePath = self.deltaDataLoc
+            print("starting upsert")
+            oldTable = DeltaTable.forPath(spark, tablePath)
+            updated_time = self.curr_time()
+            print(updated_time)
+            oldTable.alias("oldData").merge(dataFrame.alias("newData"),
+                                            'oldData.timeid = newData.timeid and oldData.metric_name = newData.metric_name and oldData.lob = newData.lob').whenMatchedUpdate(
+                condition="oldData.metric_value <> newData.metric_value",
+                set={"metric_value": col("newData.metric_value"),
+                     "update_ts": lit(updated_time)}).whenNotMatchedInsertAll().execute()
+            print("upsert done")
+
+        elif (self.loadType.lower() == "append"):
+            dataFrame.write.partitionBy("timeid").format("delta").mode("append").option("overwriteSchema", "true").save(
+            self.deltaDataLoc)
+
+        elif (self.loadType.lower() == "overwrite"):
+            dataFrame.write.partitionBy("timeid").format("delta").mode("overwrite").option("overwriteSchema", "true").save(
+            self.deltaDataLoc)
+
+    except Exception as e:
+        print(str(e))
+
+
+def create_view(self, spark):
+    spark.sql(f"create database if not exists {self.databaseName}")
+    createString = f"create table if not exists {self.databaseName}.{self.tableName} ( \n"
+    finalString = createString + f""") using DELTA location "{self.deltaDataLoc}" """
+    print(finalString)
+    spark.sql(finalString)
+    print("view created!")
+
+
+def generateToken(self):
+    headers_token_generation = {
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+
+    token_generation_data = {
+        "grant_type": "client_credentials",
+        "scope": self.commonFrameworkClientScope,
+        "client_id": self.commonFrameworkClientID,
+        "client_secret": self.commonFrameworkClientSecret
+    }
+
+    res = req.post(self.tokenEndpoint, data=token_generation_data, headers=headers_token_generation)
+    response = res.json()
+    token_value = response["access_token"]
+    OAuth_Token = "Bearer " + token_value
+    return OAuth_Token
+data_file = pd.read_csv("FPC.csv", on_bad_lines='skip',names=['col1','col2', 'col3','col4','col5', 'col6','col7','col8', 'col9',
+                                                           'col10','col11', 'col12','col13'])
+print(data_file)
+# data = data.astype({'col1': str,'col2': str,'col2': str})
+data_file = data_file.astype(str)
+calcmetric_df='ggg'
+data = APICall.form_data_structure(fpc_raw_data=data_file, calcmetric_df=calcmetric_df)
+# if __name__ == '__main__':
+#     try:
+#         api_instance = APICall(job_config_path="dbfs:/FileStore/kpi_test/quarter/configs/config_json.json",
+#                                api_config_path="dbfs:/FileStore/kpi_test/api_config_uhg.json",
+#                                cf_creds_path="dbfs:/FileStore/kpi_test/quarter/configs/common_framework_credentials.json",
+#                                jobName="testJob-kpi-rx14")
+#         token = api_instance.generateToken()
+#
+#         print("Job Started")
+#         jobstart = api_instance.jobStart(token)
+#
+#         code_exception = False
+#         if jobstart['response'] == True:
+#             code_exception = True
+#             login_Var = api_instance.login("/dbfs/tmp/config_path/api_config_uhg.json")
+#             calcmetric_df = api_instance.get_calcmetric_mapping()
+#             json_obj = api_instance.request_call()
+#             data = api_instance.form_data_structure(json_object=json_obj, calcmetric_df=calcmetric_df)
+#             dataframe = api_instance.createDF(data=data)
+#             final_df = api_instance.time_lvl_join(df=dataframe)
+#             api_instance.write_delta(spark, dataFrame=final_df)
+#             api_instance.create_view(spark)
+#
+#         # else:
+#             # raise Exception()
+#
+#         print("im here")
+#         jobend = api_instance.jobEnd(token)
+#         if jobend['response'] == True:
+#             print("Job Succeeded!")
+#
+#         else:
+#             print("im here 2")
+#             raise Exception()
+#
+#     except Exception as e:
+#         if code_exception == False:
+#             raise Exception("Job start or end Failed!")
+# else:
+#     print("Job Failed")
+#     print(str(e))
+#     api_instance = APICall(job_config_path="dbfs:/FileStore/kpi_test/quarter/configs/config_json.json",
+#                            api_config_path="dbfs:/FileStore/kpi_test/api_config_uhg.json",
+#                            cf_creds_path="dbfs:/FileStore/kpi_test/quarter/configs/common_framework_credentials.json",
+#                            jobName="testJob-kpi1")
+#     token = api_instance.generateToken()
+#     jobfail = api_instance.jobFail(token)
+#     raise Exception()
