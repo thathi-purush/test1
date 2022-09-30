@@ -1,0 +1,281 @@
+import requests
+import json
+import aanalytics2 as api2
+import requests as req
+import pandas as pd
+from datetime import datetime
+from pyspark.sql.types import StringType, IntegerType, StructType, StructField , FloatType, DoubleType, DecimalType, DateType
+from pyspark.sql.functions import col,lit
+from delta.tables import *
+from pyspark.sql import SparkSession
+import pytz
+import os
+import fsspec
+import sys
+import time
+
+spark = SparkSession.builder.getOrCreate()
+print('Form Data Structure spark session created')
+
+class formDataStructure():
+    def __init__(self, api_instance):
+
+        self.api_config = json.loads(open("/dbfs/tmp/config_path/api_config_uhg.json").read())
+        self.job_config = json.loads(open("/dbfs/tmp/config_path/job_config.json").read())
+        self.cf_config = json.loads(open("/dbfs/tmp/config_path/cf_config.json").read())
+
+        self.refreshMapping = self.job_config['refreshMapping']
+        self.endpoint_uhg = api_instance.endpoint_uhg
+        self.metricSource = self.job_config['metricSource']
+        self.lob = self.job_config['lob']
+        self.headers_uhg = api_instance.headers_uhg
+        self.body=api_instance.body
+        self.timeLevel = self.job_config['timeLevel']
+        self.job_details = self.job_config['job_details']
+        self.jobName = self.job_details['jobname']
+
+    def get_calcmetric_mapping(self):
+        if self.refreshMapping == "Y" :
+            rsids = ['']
+            calcmetric_df = self.endpoint_uhg.getCalculatedMetrics(rsid = rsids)
+            calcmetric_df.to_csv("/dbfs/tmp/calcmetrics_mapping.csv")
+        else:
+            calcmetric_df = pd.read_csv("/dbfs/tmp/calcmetrics_mapping.csv")
+
+        print("Calculated Metrics Mapping written successfully!")
+
+        return calcmetric_df
+
+    def _get_column_name(self, column_id, calcmetric_df):
+        col_row = calcmetric_df[calcmetric_df['id'] == column_id]
+
+        if col_row.shape[0] == 0 or col_row.shape[0] > 1:
+            return None
+        if "mobileapp" in self.jobName:
+            col = col_row.iloc[0]['description']
+        else:
+            col = col_row.iloc[0]['name']
+        return col
+
+    def _get_date(self, rsid, dimension, date_today, headers):
+        item_endpoint = "https://analytics.adobe.io/api/united8/reports/topItems?rsid={rsid}&dimension={dimension}&locale=en_US&lookupNoneValues=true&limit=1200&page=0&dateRange=2020-01-01T00%3A00%3A00.000%2F{today}T00%3A00%3A00.000"
+        res = req.get(item_endpoint.format(dimension=dimension, rsid=rsid, today=date_today), headers=headers)
+        res_json = json.loads(res.text)
+        res_rows = res_json['rows']
+        return res_rows
+        #print(res_rows)
+
+    def _get_metric_name_segments(self, lob_evar38, evar38Flag, metric_name):
+
+        if (self.metricSource).lower() == "adobe":
+            category_type = "Site Activity"
+        try:
+            splitted = metric_name.split("|")
+            channel = splitted[2].strip()
+            product = splitted[3].strip()
+            metric_name = splitted[4].strip()
+
+            if splitted[5] == '':
+                category = "Stand Alone"
+            else:
+                category = splitted[5].strip()
+
+            lob_metric_name = splitted[1].strip()
+            if evar38Flag == "Y":
+                lob = lob_evar38.upper()
+                return [channel, lob, product, category_type, category, metric_name]
+            else:
+                if self.lob.lower() == "no filter":
+                    lob = "ALL LoB"
+                    return [channel, lob, product, category_type, category, metric_name]
+
+                if lob_metric_name == "":
+                    lob = "ALL LoB"
+                    return [channel, lob, product, category_type, category, metric_name]
+
+                else:
+                    lob = lob_metric_name.upper()
+                    return [channel, lob, product, category_type, category, metric_name]
+
+        except:
+            raise Exception("length of metric name isnt correct!")
+
+    def _get_report_suite(self, rsid):
+        item_endpoint = f"https://analytics.adobe.io/api/united8/reportsuites/collections/suites/{rsid}"
+        res = req.get(item_endpoint, headers = self.headers_uhg)
+        res_json = json.loads(res.text)
+        return res_json['name']
+
+    def _get_curr_time(self):
+        tz_CHI = pytz.timezone('America/Chicago')
+        datetime_CHI = datetime.now(tz_CHI)
+        current_time = datetime_CHI.strftime("%Y-%m-%d %H:%M:%S")
+        return(current_time)
+
+    def _check_lob(self, metric_name):
+        evar38Flag = ""
+        try:
+            lob_evar38 = self.body['globalFilters'][0]['segmentDefinition']['container']['pred']['list'][0]
+            evar38Flag = "Y"
+            return (self._get_metric_name_segments(lob_evar38, evar38Flag, metric_name))
+        except:
+            lob_evar38 = ""
+            evar38Flag = "N"
+            arr = self._get_metric_name_segments(lob_evar38, evar38Flag, metric_name)
+            return (arr)
+
+
+    def form_data_structure(self, json_object, calcmetric_df):
+        ##main function for data transformation
+
+        print("forming data structure..")
+        data = []
+        dimension = self.body['metricContainer']['metricFilters'][0]['dimension']
+        date_today = datetime.today().strftime('%Y-%m-%d')
+        try:
+            year = self.body['metricContainer']['metricFilters'][1]['dateRange'].split('-')[0]
+            print(year)
+        except:
+            raise Exception("order of metric filter isn't correct: apply year then visits ")
+        try:
+            rsid = self.body['rsid']
+            rs_name = self._get_report_suite(rsid = self.body['rsid'])
+
+            date_response = self._get_date(self.body['rsid'], dimension, date_today, self.headers_uhg)
+        except:
+            raise Exception("report suite or _get_date issue")
+        #lob = self.body['globalFilters'][0]['segmentDefinition']['container']['pred']['list'][0]
+
+        if (self.timeLevel).lower() == "month":
+            for x in range(12): # x = January
+                for col_num in range(x, len(self.body['metricContainer']['metrics']), 12): # every metric corresponsing to x = January
+                    col_name = self._get_column_name(self.body['metricContainer']['metrics'][col_num]['id'], calcmetric_df)
+                    #print(col_name)
+                    metric_segments = self._check_lob(col_name)
+
+                    #metric value
+                    col_value = json_object['summaryData']['filteredTotals'][col_num]
+
+                    # populate date
+                    for filters in self.body['metricContainer']['metrics'][col_num].get('filters',[]):
+                        for y in self.body['metricContainer']['metricFilters']:
+                            if (filters == y['id']):
+                                if y['type'] == 'breakdown' :
+                                    itemId = y['itemId']
+                                    #print(itemId)
+
+                                    for item in date_response:
+                                        if item['itemId'] == itemId:
+                                            month = item['value']
+
+                                    date_str = month + " 01 " + year
+                                    date_val = datetime.strptime(date_str, "%B %d %Y")
+                                    month_str = date_val.strftime("%m")
+                                    timeid = year + month_str # 202201
+                    row = [timeid, rsid, rs_name] + metric_segments + [col_value]
+
+                    data.append(row)
+
+        if (self.timeLevel).lower() == "quarter":
+            quarter = ''
+            qtr_year = ''
+
+            for x in range(8): # x = Q1
+                for col_num in range(x, len(self.body['metricContainer']['metrics']), 8): # every metric corresponsing to x = Q1
+                    col_name = self._get_column_name(self.body['metricContainer']['metrics'][col_num]['id'], calcmetric_df)
+                    metric_segments = self._check_lob(col_name)
+
+                    #metric value
+                    col_value = json_object['summaryData']['filteredTotals'][col_num]
+
+                    # populate date
+                    for filters in self.body['metricContainer']['metrics'][col_num].get('filters',[]):
+                        for y in self.body['metricContainer']['metricFilters']:
+                            if (filters == y['id']):
+                                if y['type'] == 'breakdown' :
+                                    itemId = y['itemId']
+                                    for item in date_response:
+                                        if item['itemId'] == itemId:
+                                            quarter = item['value']
+                                    '''
+                                    q_strp = quarter.split("-")
+                                    first_element = q_strp[0].strip()
+                                    print(first_element)
+                                    date_val = datetime.strptime(first_element, "%b %Y")
+                                    qtr_str = date_val.strftime("%Y-%m")
+                                    qtr_yr = date_val.strftime("%Y")
+                                    print(qtr_yr)
+                                    qtr = pd.to_datetime(qtr_str).quarter
+                                    print(qtr)
+                                    timeid = qtr_yr + str(qtr)
+                                    print(timeid)
+                                    '''
+                                elif y['type'] == 'dateRange' :
+                                    num = int(filters)
+                                    qtr_year = str(self.body['metricContainer']['metricFilters'][num]['dateRange'].split('-')[0])
+                                    timeid = qtr_year + quarter
+
+                    row = [timeid, rsid, rs_name] + metric_segments + [col_value]
+
+                    data.append(row)
+
+        print("data adding to list successful!")
+        return data
+
+    def createDF(self, data):
+        print("creating schema..")
+        try:
+            schemaStr = StructType([
+                StructField("timeid", StringType(), True),
+                StructField("rpt_suite_id", StringType(), True),
+                StructField("rpt_suite_nm", StringType(), True),
+                StructField("channel", StringType(), True),
+                StructField("lob", StringType(), True),
+                StructField("product", StringType(), True),
+                StructField("category_type", StringType(), True),
+                StructField("category", StringType(), True),
+                StructField("metric_name", StringType(), True),
+                StructField("metric_value", StringType(), True)
+            ])
+            df = spark.createDataFrame(data=data,schema=schemaStr)
+        except:
+            raise Exception("datatypes dont match!!")
+
+        create_ts = self._get_curr_time()
+        df = df.withColumn("create_ts", lit(create_ts)).withColumn("update_ts", lit(create_ts))
+        return df
+
+    def _final_data_extract(self, df):
+        df = df.withColumn("sgm_cd", lit("")) \
+            .withColumn("sgm_desc", lit("")) \
+            .withColumn("seg_cd", lit("")) \
+            .withColumn("seg_desc", lit("")) \
+            .withColumn("metric_format", lit("")) \
+            .withColumn("page_url", lit("")) \
+            .withColumn("data_src", lit(""))
+
+        col_list = ["timelvl",	"timelvlnm",	"timeid",	"timeidnm",	"rpt_suite_id",	"rpt_suite_nm",	"channel",	"lob",	"product",	"category_type",	"category",	"sgm_cd",	"sgm_desc",	"seg_cd",	"seg_desc",	"metric_name",	"metric_value",	"metric_format",	"page_url",	"data_src",	"create_ts",	"update_ts",]
+        df = df.select(*col_list)
+        df.show(10)
+        print("final data extract created!")
+        return df
+
+    def time_lvl_join(self, df):
+        print("im in timelevel")
+        timelvl = self.timeLevel
+        print(timelvl)
+        try:
+            time_df = spark.sql("select * from sl_kpi.timelvl_timeid_drvr_std")
+        except:
+            raise Exception("time level view is not available")
+
+        tim_df_filtered = time_df.filter(col("timelvlnm") == timelvl)
+        df_updated = tim_df_filtered.alias('tim_df_filtered') \
+            .join(df.alias('df'), tim_df_filtered.timeid == df.timeid, "inner") \
+            .select('df.*', 'tim_df_filtered.timelvl', 'tim_df_filtered.timeidnm', 'tim_df_filtered.timelvlnm')
+        print(df_updated.show(10))
+        final_df = self._final_data_extract(df = df_updated)
+        print(final_df.printSchema())
+        print("time level join completed!")
+
+        return final_df
