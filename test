@@ -532,6 +532,7 @@ class APICall():
                 print("starting upsert")
                 oldTable = DeltaTable.forPath(spark, tablePath)
                 updated_time = self.curr_time()
+                print("printing updated_time")
                 print(updated_time)
                 oldTable.alias("oldData").merge(dataFrame.alias("newData"), 'oldData.timeid = newData.timeid and oldData.metric_id = newData.metric_id and oldData.lob = newData.lob').whenMatchedUpdate(condition = "oldData.metric_value <> newData.metric_value", set ={"metric_value": col("newData.metric_value"), "update_ts": lit(updated_time),"metric_name":col("newData.metric_name")}).whenNotMatchedInsertAll().execute()
                 print("upsert done")
@@ -689,7 +690,8 @@ class APICall():
         print("notification reposnse", response)
         
         
-     if __name__ == '__main__':
+        
+        if __name__ == '__main__':
 
     code_exception = False
     try:
@@ -701,13 +703,13 @@ class APICall():
         token = api_instance.generateToken()
 
         print("Job Started")
-#         jobstart = api_instance.jobStart(token)
+        jobstart = api_instance.jobStart(token)
 
         code_exception = False
           
 
-#         if jobstart['response'] == True:
-        if True:
+        if jobstart['response'] == True:
+#         if True:
             code_exception = True
             login_Var = api_instance.login("/dbfs/tmp/config_path/api_config_uhg.json")
             calcmetric_df = api_instance.get_calcmetric_mapping()
